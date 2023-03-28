@@ -1,0 +1,5 @@
+smallpt_transient
+
+*.ppm
+*.gif
+!images/*

@@ -131,7 +131,7 @@ inline bool intersect(const Ray &r, double &t, int &id)
 //   Xi: random number seed
 //   E: wheter to include emissive color
 //   return value: the vector with the radiance estimate
-Vec radiance(const Ray &r, int &depth, double &distance, unsigned short *Xi, int E = 1)
+Vec radiance(const Ray &r, int &depth, double &distance, double ior, unsigned short *Xi, int E = 1)
 {
     double t;   // distance to intersection
     int id = 0; // index of intersected object
@@ -142,7 +142,8 @@ Vec radiance(const Ray &r, int &depth, double &distance, unsigned short *Xi, int
 
     const Sphere &obj = spheres[id]; // the hit object
 
-    distance = distance + t;
+    // Correct the distance with the current index of refraction
+    distance = distance + t * ior;
 
     // Surface properties
     Vec x = r.o + r.d * t;                // ray intersection point
@@ -160,13 +161,9 @@ Vec radiance(const Ray &r, int &depth, double &distance, unsigned short *Xi, int
     if (++depth > 5 || !p)
     {
         if (erand48(Xi) < p)
-        {
             f = f * (1 / p);
-        }
         else
-        {
             return obj.e * E;
-        }
     }
 
     if (obj.refl == DIFF)
@@ -186,13 +183,13 @@ Vec radiance(const Ray &r, int &depth, double &distance, unsigned short *Xi, int
         // Sample unit hemisphere
         Vec d = (u * cos(r1) * r2s + v * sin(r1) * r2s + w * sqrt(1 - r2)).norm(); // d is random reflection ray
 
-        return obj.e * E + f.mult(radiance(Ray(x, d), depth, distance, Xi, 1));
+        return obj.e * E + f.mult(radiance(Ray(x, d), depth, distance, ior, Xi, 1));
     }
     else if (obj.refl == SPEC)
     {
         // Ideal specular (mirror) reflection
         // Reflected ray: angle of incidence = angle of reflection
-        return obj.e + f.mult(radiance(Ray(x, r.d - n * 2 * n.dot(r.d)), depth, distance, Xi));
+        return obj.e + f.mult(radiance(Ray(x, r.d - n * 2 * n.dot(r.d)), depth, distance, ior, Xi));
     }
 
     // Otherwise, we have a dielectric (glass) surface
@@ -203,12 +200,15 @@ Vec radiance(const Ray &r, int &depth, double &distance, unsigned short *Xi, int
     Ray refl_ray(x, r.d - n * 2 * n.dot(r.d));
 
     // Determine if ray is entering of exiting glass
-    bool into = n.dot(nl) > 0; // Ray from outside going in?
+    bool into = n.dot(nl) > 0; // Is ray from outside going in?
 
     double nc = 1;                         // Index of refraction for air
     double nt = 1.5;                       // Index of refraction for glass
-    double nnt = into ? nc / nt : nt / nc; // nnt is 1/1.5 if ray goes air-glass
-                                           // of 1.5, if goes glass-air
+    double nnt = into ? nc / nt : nt / nc; // nnt is 1/1.5 if ray goes air-glass, or 1.5 if goes glass-air
+
+    // Note: This doesn't handle correctly nested dielectrics
+    // When ray exits a dielectric, we assume the medium is air
+
     double ddn = r.d.dot(nl);
     double cos2t;
 
@@ -218,7 +218,7 @@ Vec radiance(const Ray &r, int &depth, double &distance, unsigned short *Xi, int
 
     // If total internal reflection, reflect
     if ((cos2t = 1 - nnt * nnt * (1 - ddn * ddn)) < 0) // Total internal reflection
-        return obj.e + f.mult(radiance(refl_ray, depth, distance, Xi));
+        return obj.e + f.mult(radiance(refl_ray, depth, distance, into ? nc : nt, Xi));
 
     // Otherwise, choose reflection or refraction using the Fresnel term
 
@@ -242,9 +242,10 @@ Vec radiance(const Ray &r, int &depth, double &distance, unsigned short *Xi, int
     // P = probability of reflecting
     // Russian roulette to sample reflection or refraction
     if (erand48(Xi) < P)
-        return obj.e + f.mult(radiance(refl_ray, depth, distance, Xi) * RP);
+        return obj.e + f.mult(radiance(refl_ray, depth, distance, into ? nc : nt, Xi) * RP);
     else
-        return obj.e + f.mult(radiance(Ray(x, tdir), depth, distance, Xi) * TP);
+        return obj.e + f.mult(radiance(Ray(x, tdir), depth, distance, into ? nt : nc, Xi) * TP);
+
 }
 
 // Main function, loops over image pixels, creates image, and saves it to a PPM file
@@ -256,9 +257,9 @@ int main(int argc, char *argv[])
     // Transient rendering:
     // Temporal slices are defined using the optical distance (the distance that a ray travels across the scene)
     // instead of the time of flight to avoid extra divisions
-    int start = 0, end = 1200, delta = 8;   // start and end distances, and step size betwen slices
-    int num_slices = (end - start) / delta; // number of temporal slices
-    bool continuous = true;                // Make lights emit a delta pulse or continous illumination
+    int d_start = 0, d_end = 1200, d_delta = 8;   // start and end distances, and step size betwen slices
+    int num_slices = (d_end - d_start) / d_delta; // number of temporal slices
+    bool continuous_light = false;                // Make lights emit a delta pulse or continous illumination
 
     // Read number of samples
     int samps = argc == 2 ? atoi(argv[1]) : 1;
@@ -278,9 +279,7 @@ int main(int argc, char *argv[])
 
     // Initialize counts
     for (int i = 0; i < num_slices * w * h; i++)
-    {
         counts[i] = 0;
-    }
 
 // Run each iteration of the outer loop in its own thread
 #pragma omp parallel for schedule(dynamic, 1) private(r) // OpenMP
@@ -321,20 +320,20 @@ int main(int argc, char *argv[])
                 // Use radiance function to estimate radiance
                 int depth = 0;
                 double distance = 0;
-                Vec sample = radiance(Ray(cam.o + d * 140, d.norm()), depth, distance, Xi);
+                Vec sample = radiance(Ray(cam.o + d * 140, d.norm()), depth, distance, 1.0, Xi);
                 r = r + sample * (1.0 / samps);
 
-                if (distance < end)
+                if (distance < d_end)
                 {
-                    int t = distance / delta; // find time slice
+                    int t = distance / d_delta; // find time slice
                     int ti = t * h * w + i;
                     bins[ti] = bins[ti] + sample;
                     counts[ti] = counts[ti] + 1;
 
-                    if (continuous)
+                    if (continuous_light)
                     {
                         // Save radiance in all future time slices
-                        for (int tp = t + 1; tp < end / delta; tp++)
+                        for (int tp = t + 1; tp < d_end / d_delta; tp++)
                         {
                             int ti = tp * h * w + i;
                             bins[ti] = bins[ti] + sample;
